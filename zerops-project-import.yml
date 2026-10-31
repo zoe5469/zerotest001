@@ -11,7 +11,7 @@ project:
 
 services:
   - hostname: portal
-    type: go@latest
+    type: go@1
     zeropsSetup: portal
     buildFromGit: https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME
     enableSubdomainAccess: true
@@ -28,7 +28,7 @@ services:
       maxDisk: 2
     envSecrets:
       CLOUDFLARE_API_TOKEN: ""
-      ZEROPS_API_TOKEN: ""
+      BERMUDA_ZEROPS_TOKEN: ""
       CUSTOM_DOMAIN: ""
       BERMUDA_MASTER_KEY: "bmk-<@generateRandomString(<32>)>"
       BERMUDA_REGION: "prg1"
