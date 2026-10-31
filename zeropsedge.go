@@ -164,6 +164,44 @@ func (info *ZeropsCustomDomainInfo) IsCertificateValid() bool {
 	return strings.Contains(st, "VALID") || strings.Contains(st, "ACTIVE")
 }
 
+// deriveSubdomainFromIPv6 extracts the last hexadecimal group of the project's
+// free Dedicated IPv6 address (e.g. "3a3e" from "2a00:1ed0:1100::160:0:3a3e")
+// and deterministically synthesizes the Zerops subdomain (e.g. "portal-3a3e-8080.prg1.zerops.app").
+func deriveSubdomainFromIPv6(serviceName, ipv6Str string, port int, region string) string {
+	cleanV6 := sanitizeIPv6Address(ipv6Str)
+	if cleanV6 == "" {
+		return ""
+	}
+
+	parts := strings.Split(cleanV6, ":")
+	var lastSegment string
+	for i := len(parts) - 1; i >= 0; i-- {
+		seg := strings.TrimSpace(parts[i])
+		if seg != "" {
+			lastSegment = seg
+			break
+		}
+	}
+	if lastSegment == "" {
+		return ""
+	}
+
+	srv := cleanHost(serviceName)
+	if srv == "" || isZeropsManagedDomain(srv) {
+		srv = "portal"
+	}
+	if port <= 0 {
+		port = defaultZPTargetPort
+	}
+	reg := normalizeRegion(region)
+	if reg == "" {
+		reg = "prg1"
+	}
+
+	candidate := fmt.Sprintf("%s-%s-%d.%s.zerops.app", srv, lastSegment, port, reg)
+	return normalizeZeropsSubdomain(candidate)
+}
+
 type ZeropsClient struct {
 	Token       string
 	ClientID    string
@@ -190,9 +228,9 @@ func sanitizeZeropsToken(raw string) string {
 	s := strings.TrimSpace(raw)
 	upper := strings.ToUpper(s)
 	for _, prefix := range []string{
+		"BERMUDA_ZEROPS_TOKEN",
 		"ZEROPS_API_TOKEN",
 		"ZEROPS_TOKEN",
-		"BERMUDA_ZEROPS_TOKEN",
 		"ZEROPS_ACCESS_TOKEN",
 	} {
 		if strings.HasPrefix(upper, prefix) {
@@ -235,9 +273,9 @@ func NewZeropsClient(token string) *ZeropsClient {
 	}
 	apiURL = strings.TrimRight(apiURL, "/")
 
-	projID := sanitizeExplicitCredential(getEnv("ZEROPS_PROJECT_ID", getEnv("PROJECT_ID", "")))
-	srvID := sanitizeExplicitCredential(getEnv("ZEROPS_SERVICE_ID", getEnv("ZEROPS_SERVICE_STACK_ID", getEnv("SERVICE_STACK_ID", ""))))
-	srvName := sanitizeExplicitCredential(getEnv("ZEROPS_SERVICE_NAME", getEnv("SERVICE_NAME", "")))
+	projID := sanitizeExplicitCredential(getEnv("ZEROPS_PROJECT_ID", getEnv("PROJECT_ID", getEnv("projectId", ""))))
+	srvID := sanitizeExplicitCredential(getEnv("ZEROPS_SERVICE_ID", getEnv("ZEROPS_SERVICE_STACK_ID", getEnv("SERVICE_STACK_ID", getEnv("serviceStackId", "")))))
+	srvName := sanitizeExplicitCredential(getEnv("ZEROPS_SERVICE_NAME", getEnv("SERVICE_NAME", getEnv("serviceName", ""))))
 
 	if srvName == "" {
 		if hn, err := os.Hostname(); err == nil {
@@ -250,7 +288,7 @@ func NewZeropsClient(token string) *ZeropsClient {
 		}
 	}
 
-	return &ZeropsClient{
+	zc := &ZeropsClient{
 		Token:         cleanTok,
 		ProjectID:     projID,
 		ServiceID:     srvID,
@@ -264,6 +302,14 @@ func NewZeropsClient(token string) *ZeropsClient {
 			Timeout: 20 * time.Second,
 		},
 	}
+
+	if zc.serviceDomain == "" && zc.projectIPv6 != "" {
+		if derived := deriveSubdomainFromIPv6(zc.ServiceName, zc.projectIPv6, zc.TargetPort, "prg1"); derived != "" {
+			zc.serviceDomain = derived
+		}
+	}
+
+	return zc
 }
 
 func (c *ZeropsClient) IsConfigured() bool {
@@ -376,6 +422,11 @@ func (c *ZeropsClient) SetProjectIPv6(ipv6 string) {
 	}
 	c.mu.Lock()
 	c.projectIPv6 = clean
+	if c.serviceDomain == "" || !isFullZeropsServiceDomain(c.serviceDomain) {
+		if derived := deriveSubdomainFromIPv6(c.ServiceName, clean, c.TargetPort, c.discoveredRegion); derived != "" {
+			c.serviceDomain = derived
+		}
+	}
 	c.mu.Unlock()
 }
 
@@ -731,6 +782,30 @@ func (c *ZeropsClient) ResolveRuntimeContext(ctx context.Context) error {
 	srvDom := c.serviceDomain
 	c.mu.RUnlock()
 
+	// 1. Check if Zerops injected environment variables under camelCase or UPPER_CASE
+	if srvID == "" {
+		for _, envKey := range []string{"serviceStackId", "SERVICE_STACK_ID", "ZEROPS_SERVICE_ID", "serviceId"} {
+			if val := strings.TrimSpace(os.Getenv(envKey)); val != "" {
+				srvID = val
+				c.mu.Lock()
+				c.ServiceID = val
+				c.mu.Unlock()
+				break
+			}
+		}
+	}
+	if projID == "" {
+		for _, envKey := range []string{"projectId", "PROJECT_ID", "ZEROPS_PROJECT_ID"} {
+			if val := strings.TrimSpace(os.Getenv(envKey)); val != "" {
+				projID = val
+				c.mu.Lock()
+				c.ProjectID = val
+				c.mu.Unlock()
+				break
+			}
+		}
+	}
+
 	if srvID != "" {
 		c.enrichServiceDetails(ctx, srvID)
 		c.mu.RLock()
@@ -742,7 +817,7 @@ func (c *ZeropsClient) ResolveRuntimeContext(ctx context.Context) error {
 		return nil
 	}
 
-	// Step 1: Query /user-info to discover ClientID (organization)
+	// 2. Query /user-info to discover ClientID (organization)
 	if rawUser, _, err := doZPRequest(ctx, c, http.MethodGet, "/user-info", nil); err == nil && len(rawUser) > 0 {
 		var uMap map[string]any
 		if json.Unmarshal(rawUser, &uMap) == nil {
@@ -760,7 +835,7 @@ func (c *ZeropsClient) ResolveRuntimeContext(ctx context.Context) error {
 		}
 	}
 
-	// Step 2: Search service stacks via POST /service-stack/search
+	// 3. Search service stacks via POST /service-stack/search
 	c.mu.RLock()
 	clientID := c.ClientID
 	c.mu.RUnlock()
@@ -854,8 +929,6 @@ func (c *ZeropsClient) ResolveRuntimeContext(ctx context.Context) error {
 	return errors.New("unable to auto-discover zerops service stack ID")
 }
 
-// persistMasterKeyViaLocalZSC uses Zerops's built-in `/opt/zerops/bin/zsc` tool
-// inside the Incus container to persist `BERMUDA_MASTER_KEY` without needing an API token.
 func persistMasterKeyViaLocalZSC(ctx context.Context, masterKey string) bool {
 	cleanMK := strings.TrimSpace(masterKey)
 	if cleanMK == "" {
@@ -949,8 +1022,6 @@ func (c *ZeropsClient) PersistMasterKey(ctx context.Context, masterKey string) b
 	return false
 }
 
-// discoverPublicEgressIPv6 queries Cloudflare's IPv6 trace endpoint to discover
-// the container's outbound global IPv6 address if not yet known.
 func discoverPublicEgressIPv6(ctx context.Context) string {
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
@@ -993,8 +1064,6 @@ func discoverPublicEgressIPv6(ctx context.Context) string {
 	return ""
 }
 
-// EnsureServiceDomain discovers the service's free *.prg1.zerops.app subdomain
-// and enables subdomain access via `PUT /service-stack/{id}/enable-subdomain-access` if disabled.
 func (c *ZeropsClient) EnsureServiceDomain(ctx context.Context) (string, error) {
 	if c.GetProjectIPv6() == "" {
 		if v6 := discoverPublicEgressIPv6(ctx); v6 != "" {
@@ -1007,6 +1076,14 @@ func (c *ZeropsClient) EnsureServiceDomain(ctx context.Context) (string, error) 
 	}
 
 	if err := c.ResolveRuntimeContext(ctx); err != nil {
+		if c.GetServiceDomain() == "" && c.GetProjectIPv6() != "" {
+			if derived := deriveSubdomainFromIPv6(c.ServiceName, c.GetProjectIPv6(), c.TargetPort, "prg1"); derived != "" {
+				c.SetServiceDomain(derived)
+				c.notifyTopology()
+				log.Printf("[Zerops] ✓ Subdomain Derived from Dedicated IPv6 Suffix: %s", derived)
+				return derived, nil
+			}
+		}
 		return c.GetServiceDomain(), err
 	}
 
