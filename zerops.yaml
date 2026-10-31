@@ -1,3 +1,9 @@
+# ==============================================================================
+# BERMUDA PORTAL - ZEROPS.IO BUILD & RUNTIME PIPELINE
+# Platform: Zerops Cloud (Prague prg1 & US-East) · Incus System Containers
+# Architecture: Dual-Setup (portal & app) · Zero-Collision Runtime Environment
+# ==============================================================================
+
 zerops:
   - setup: portal
     build:
